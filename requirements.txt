@@ -1,0 +1,6 @@
+faker
+gspread
+pandas
+oauth2client
+psycopg2-binary
+sqlalchemy
