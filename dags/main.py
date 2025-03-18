@@ -4,9 +4,11 @@ from airflow.utils.dates import days_ago
 from airflow.hooks.base import BaseHook
 import pandas as pd
 from faker import Faker
+from airflow.utils.email import send_email
 import logging
 import random
 import os
+import requests
 from sqlalchemy import create_engine
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -16,6 +18,7 @@ from datetime import timedelta, datetime
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RoB52Rk-71uQiuplol7yhLvgWHFv3v079u-yMEQEu8o/edit?usp=sharing"
 POSTGRES_CONN = "postgres_def"
 TABLE_NAME = "transaction table"
+FAKE_TABLE_NAME= "fake_invoices"
 logger = logging.getLogger(__name__)
 
 def generate_fake_data(**kwargs):
@@ -102,6 +105,73 @@ def load_to_postgres():
     df.to_sql(TABLE_NAME, engine, if_exists='replace', index=False)
 
 
+#Send Load success mail
+def notify_success(context):
+    subject = "Airflow Alert: Data Pulled to Google Sheets"
+    body = "The data pull to Google Sheets was successful!"
+    send_email(to="opsyyjoe@gmail.com", subject=subject, html_content=body)
+    
+
+#Fetch Fake Invoices
+def fetch_fake_cart(**kwargs):
+    url = "https://dummyjson.com/carts"
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        data = response.json()["carts"]  # Extract the "carts" list
+        invoices = []  
+
+        # Flatten the nested JSON
+        for cart in data:
+            cart_id = cart["id"]
+            user_id = cart["userId"]
+            total = cart["total"]
+            discounted_total = cart["discountedTotal"]
+            total_products = cart["totalProducts"]
+            total_quantity = cart["totalQuantity"]
+
+            # Extract products within each cart
+            for product in cart["products"]:
+                invoices.append({
+                    "cart_id": cart_id,
+                    "user_id": user_id,
+                    "total": total,
+                    "discounted_total": discounted_total,
+                    "total_products": total_products,
+                    "total_quantity": total_quantity,
+                    "product_id": product["id"],
+                    "product_title": product["title"],
+                    "product_price": product["price"],
+                    "product_quantity": product["quantity"],
+                    "product_total": product["total"],
+                    "discount_percentage": product["discountPercentage"],
+                    "discounted_price": product["discountedTotal"],
+                    "thumbnail": product["thumbnail"]
+                })
+
+        # Convert to DataFrame
+        df = pd.DataFrame(invoices)
+
+        # Save the structured data
+        file_path = "/opt/airflow/fake_invoices.csv"
+        df.to_csv(file_path, index=False)
+        kwargs['ti'].xcom_push(key="invoice_data_path", value=file_path)
+
+    else:
+        raise Exception(f"Failed to fetch invoice data: {response.status_code}")
+
+def load_fake_invoice_to_postgres(**kwargs):
+    ti = kwargs['ti']
+    file_path = ti.xcom_pull(task_ids='fetch_fake_invoice', key="invoice_data_path")
+    logger.info(f"Loading invoice data from: {file_path}")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    df = pd.read_csv(file_path)
+    conn = BaseHook.get_connection("postgres_def")
+    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+    engine = create_engine(postgres_url)
+    df.to_sql(FAKE_TABLE_NAME, engine, if_exists='replace', index=False)
+    logger.info("Fake invoice data loaded successfully into PostgreSQL")
 
 # Define DAG
 default_args = {
@@ -113,7 +183,7 @@ default_args = {
 }
 
 dag = DAG(
-    'google_sheets_to_postgres_vpro',
+    'google_sheets_to_postgres_vp',
     default_args=default_args,
     schedule_interval='@daily',
     catchup=False,
@@ -133,6 +203,7 @@ push_to_sheet = PythonOperator(
     python_callable=push_to_google_sheets,
     execution_timeout=timedelta(minutes=1),
     provide_context=True,
+    on_success_callback=notify_success,
     dag=dag
 )
 
@@ -150,6 +221,24 @@ load_postgres = PythonOperator(
 )
 
 
+fetch_cart = PythonOperator(
+    task_id='fetch_fake_invoice',
+    python_callable=fetch_fake_cart,
+    dag=dag,
+)
 
+load_fake_invoice = PythonOperator(
+    task_id='load_fake_invoice',
+    python_callable=load_fake_invoice_to_postgres,
+    dag=dag,
+)
 
-generate_data >> push_to_sheet >> extract_sheet >> load_postgres
+#generate_data >> push_to_sheet >> extract_sheet >> load_postgres
+generate_data >> [extract_sheet, fetch_cart]  # Ensure both tasks wait for faker generated data
+push_to_sheet >> extract_sheet
+extract_sheet >> load_postgres
+
+fetch_cart >> load_fake_invoice
+
+# Ensure both data sources are loaded simultaneously
+[load_postgres, load_fake_invoice]
