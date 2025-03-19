@@ -4,12 +4,14 @@ from airflow.utils.dates import days_ago
 from airflow.hooks.base import BaseHook
 import pandas as pd
 from faker import Faker
+from fetch_product_names import fetch_product_titles
+from pdf_extractor import extract_customer_data_from_pdf
 from airflow.utils.email import send_email
 import logging
 import random
 import os
 import requests
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import timedelta, datetime
@@ -17,47 +19,62 @@ from datetime import timedelta, datetime
 # Define Connections and variables to be used
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RoB52Rk-71uQiuplol7yhLvgWHFv3v079u-yMEQEu8o/edit?usp=sharing"
 POSTGRES_CONN = "postgres_def"
-TABLE_NAME = "transaction table"
-FAKE_TABLE_NAME= "fake_invoices"
+INVOICE_TABLE_NAME = "invoice"
+CART_TABLE_NAME= "cart"
 PRODUCTS_TABLE_NAME= "products"
 REVIEWS_TABLE_NAME= "reviews"
+CUSTOMER_TABLE_NAME = "customers"
 logger = logging.getLogger(__name__)
 
-def generate_fake_data(**kwargs):
+
+"""External Data Used;
+   https://dummyjson.com/
+   Faker Module
+   Googlesheet
+   --Web Scrape: Currently looking for source
+"""
+
+def generate_invoice_data(**kwargs):
     ti = kwargs['ti']
     fake = Faker()
     try:
-        output_folder = "/opt/airflow/generated_data"
+        output_folder = "/opt/airflow/data/"
         os.makedirs(output_folder, exist_ok=True)
 
-        products = [
-            ("Apple", 0.5), ("Banana", 0.3), ("Milk", 2.0), ("Bread", 1.5),
-            ("Eggs", 3.0), ("Chicken", 5.0), ("Rice", 4.0), ("Pasta", 2.5)
-        ]
+        products = ti.xcom_pull(task_ids='fetch_product_titles', key="product_list")
+        
+        if not products:
+            logger.warning("No products found in XCom. Using default product list.")
+            products = [
+                ("Apple", 0.5), ("Banana", 0.3), ("Milk", 2.0), ("Bread", 1.5),
+                ("Eggs", 3.0), ("Chicken", 5.0), ("Rice", 4.0), ("Pasta", 2.5)
+            ]
 
         transaction_data = []
-        for _ in range(700):
+        for _ in range(1000):
+            product = random.choice(products)
             transaction_data.append([
                 f"INV{fake.unique.random_int(min=100000, max=999999)}",
                 fake.date_between(start_date="-1y", end_date="today"),
                 fake.name(),
-                random.choice(products)[0],
+                product[0],
                 random.randint(1, 10),
-                random.choice(products)[1],
-                round(random.randint(1, 10) * random.choice(products)[1], 2),
+                product[1],
+                round(random.randint(1, 10) * product[1], 2),
                 random.choice(["PostgreSQL", "Google Sheets", "CSV"]),
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                random.randint(1,30),
+                random.randint(1,30)
             ])
 
         df = pd.DataFrame(transaction_data, columns=[
             "Invoice Number", "Invoice Date", "Customer Name",
-            "Product Name", "Quantity", "Unit Price", "Total Amount", "Platform", "Last Update"
+            "Product Name", "Quantity", "Unit Price", "Total Amount", "Platform", "Last Update","Product ID","Customer ID"
         ])
 
-        output_path = os.path.join(output_folder, f"supermarket_transactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        output_path = os.path.join(output_folder, f"invoice_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         df.to_csv(output_path, index=False)
         
-        # Push file path to XCom
         ti.xcom_push(key="csv_path", value=output_path)
 
         logger.info(f"File saved to: {output_path}")
@@ -65,18 +82,38 @@ def generate_fake_data(**kwargs):
     except Exception as e:
         logger.error(f"Error occurred: {e}", exc_info=True)
 
+def load_invoice(**kwargs):
+    ti = kwargs['ti']
+    file_path = ti.xcom_pull(task_ids='generate_invoice_data', key="csv_path")
+    logger.info(f"Loading invoice data from: {file_path}")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    df = pd.read_csv(file_path)
+    conn = BaseHook.get_connection("postgres_def")
+    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+    engine = create_engine(postgres_url)
+    df.to_sql(CART_TABLE_NAME, engine, if_exists='replace', index=False)
+    logger.info("Fake invoice data loaded successfully into PostgreSQL")
+
+
+def load_customer_details():
+    df = pd.read_csv("/opt/airflow/data/customer_data.csv")
+    conn = BaseHook.get_connection("postgres_def")
+    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+    engine = create_engine(postgres_url)
+    df.to_sql(CUSTOMER_TABLE_NAME, engine, if_exists='append', index=False)
 
 #Push to sheet
 def push_to_google_sheets(**kwargs):
     ti = kwargs['ti']
-    file_path = ti.xcom_pull(task_ids='generate_data', key="csv_path")
+    file_path = ti.xcom_pull(task_ids='generate_invoice_data', key="csv_path")
 
     if not file_path:
         logger.error("No file path found from generate_data task")
         return
 
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("/opt/airflow/jireh-ope-9348c4d91fd9.json", scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_name("/opt/airflow/data/jireh-ope-9348c4d91fd9.json", scope)
     client = gspread.authorize(creds)
     sheet = client.open_by_url(GOOGLE_SHEET_URL).sheet1
 
@@ -90,22 +127,35 @@ def push_to_google_sheets(**kwargs):
 # Extract Sheet
 def extract_google_sheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("/opt/airflow/jireh-ope-9348c4d91fd9.json", scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_name("/opt/airflow/data/jireh-ope-9348c4d91fd9.json", scope)
     client = gspread.authorize(creds)
     
     sheet = client.open_by_url(GOOGLE_SHEET_URL).sheet1
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    df.to_csv("/opt/airflow/google_sheets_data.csv", index=False)
+    df.to_csv("/opt/airflow/data/google_sheets_data.csv", index=False)
 
-#Load to postgres
+# #Load to postgres
+# def load_to_postgres():
+#     df = pd.read_csv("/opt/airflow/data/google_sheets_data.csv")
+#     conn = BaseHook.get_connection("postgres_def")
+#     postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+#     engine = create_engine(postgres_url)
+#     df.to_sql(INVOICE_TABLE_NAME, engine, if_exists='append', index=False)
+
 def load_to_postgres():
-    df = pd.read_csv("/opt/airflow/google_sheets_data.csv")
+    df = pd.read_csv("/opt/airflow/data/google_sheets_data.csv")
     conn = BaseHook.get_connection("postgres_def")
     postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
     engine = create_engine(postgres_url)
-    df.to_sql(TABLE_NAME, engine, if_exists='replace', index=False)
-
+    inspector = inspect(engine)
+    existing_columns = [col["name"] for col in inspector.get_columns(INVOICE_TABLE_NAME)]
+    for col in df.columns:
+        if col not in existing_columns:
+            print(f"⚠️ WARNING: Column '{col}' does not exist in the database!")
+    df = df[[col for col in df.columns if col in existing_columns]]
+    df.to_sql(INVOICE_TABLE_NAME, engine, if_exists='append', index=False)
+    print("✅ Data successfully appended to PostgreSQL.")
 
 #Send Load success mail
 def notify_success(context):
@@ -114,7 +164,7 @@ def notify_success(context):
     send_email(to="opsyyjoe@gmail.com", subject=subject, html_content=body)
     
 
-#Fetch Fake Invoices
+#Fetch Fake Carts
 def fetch_fake_cart(**kwargs):
     url = "https://dummyjson.com/carts"
     response = requests.get(url)
@@ -156,25 +206,12 @@ def fetch_fake_cart(**kwargs):
         df = pd.DataFrame(invoices)
 
         # Save the structured data
-        file_path = "/opt/airflow/fake_invoices.csv"
+        file_path = "/opt/airflow/data/cart.csv"
         df.to_csv(file_path, index=False)
-        kwargs['ti'].xcom_push(key="invoice_data_path", value=file_path)
+        kwargs['ti'].xcom_push(key="cart_data_path", value=file_path)
 
     else:
         raise Exception(f"Failed to fetch invoice data: {response.status_code}")
-
-def load_fake_invoice_to_postgres(**kwargs):
-    ti = kwargs['ti']
-    file_path = ti.xcom_pull(task_ids='fetch_fake_invoice', key="invoice_data_path")
-    logger.info(f"Loading invoice data from: {file_path}")
-    if not file_path or not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found at: {file_path}")
-    df = pd.read_csv(file_path)
-    conn = BaseHook.get_connection("postgres_def")
-    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
-    engine = create_engine(postgres_url)
-    df.to_sql(FAKE_TABLE_NAME, engine, if_exists='replace', index=False)
-    logger.info("Fake invoice data loaded successfully into PostgreSQL")
 
 #Fetch products and reviews
 def fetch_fake_product(**kwargs):
@@ -217,9 +254,9 @@ def fetch_fake_product(**kwargs):
         reviews_df=pd.DataFrame(reviews_list)
 
 
-        # Save the structured data
-        products_file_path = "/opt/airflow/products.csv"
-        reviews_file_path = "/opt/airflow/reviews.csv"
+        
+        products_file_path = "/opt/airflow/data/products.csv"
+        reviews_file_path = "/opt/airflow/data/reviews.csv"
         products_df.to_csv(products_file_path, index=False)
         reviews_df.to_csv(reviews_file_path, index=False)
         kwargs['ti'].xcom_push(key="product_data_path", value=products_file_path)
@@ -270,9 +307,9 @@ dag = DAG(
 )
 
 
-generate_data = PythonOperator(
-    task_id='generate_data',
-    python_callable=generate_fake_data,
+generate_invoices = PythonOperator(
+    task_id='generate_invoice_data',
+    python_callable=generate_invoice_data,
     provide_context=True,
     dag=dag,
 )
@@ -302,14 +339,14 @@ load_postgres = PythonOperator(
 
 
 fetch_cart = PythonOperator(
-    task_id='fetch_fake_invoice',
+    task_id='fetch_cart_table',
     python_callable=fetch_fake_cart,
     dag=dag,
 )
 
-load_cart_db = PythonOperator(
-    task_id='load_fake_invoice',
-    python_callable=load_fake_invoice_to_postgres,
+load_invoice_db = PythonOperator(
+    task_id='load_invoice',
+    python_callable=load_invoice,
     dag=dag,
 )
 
@@ -331,9 +368,29 @@ load_reviews_db = PythonOperator(
     dag=dag,
 )
 
+fetch_products_names= PythonOperator(
+    task_id='fetch_product_titles',
+    python_callable=fetch_product_titles,
+    provide_context=True,
+    dag=dag,
+)
+
+extract_customer_data_task = PythonOperator(
+    task_id='extract_customer_data_from_pdf',
+    python_callable=extract_customer_data_from_pdf,
+    provide_context=True,
+    dag=dag,
+)
+
+load_customer_detail= PythonOperator(
+    task_id='load_customer_detail',
+    python_callable=load_customer_details,
+    dag=dag
+)
+
 
 #Load should happen at the same time for the sake of accuracy in db
-generate_data >> push_to_sheet >> extract_sheet
+extract_customer_data_task>>fetch_products_names>> generate_invoices >> push_to_sheet >> extract_sheet
 extract_sheet >> fetch_cart
 fetch_cart >> fetch_fake_products
-fetch_fake_products >> [load_products_db, load_reviews_db, load_postgres, load_cart_db]
+fetch_fake_products >> [load_products_db, load_reviews_db, load_customer_detail, load_postgres, load_invoice_db]

@@ -4,3 +4,4 @@ pandas
 oauth2client
 psycopg2-binary
 sqlalchemy
+pdfplumber
