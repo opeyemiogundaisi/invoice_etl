@@ -19,6 +19,8 @@ GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RoB52Rk-71uQiuplol7y
 POSTGRES_CONN = "postgres_def"
 TABLE_NAME = "transaction table"
 FAKE_TABLE_NAME= "fake_invoices"
+PRODUCTS_TABLE_NAME= "products"
+REVIEWS_TABLE_NAME= "reviews"
 logger = logging.getLogger(__name__)
 
 def generate_fake_data(**kwargs):
@@ -118,7 +120,7 @@ def fetch_fake_cart(**kwargs):
     response = requests.get(url)
 
     if response.status_code == 200:
-        data = response.json()["carts"]  # Extract the "carts" list
+        data = response.json()["carts"] 
         invoices = []  
 
         # Flatten the nested JSON
@@ -146,7 +148,8 @@ def fetch_fake_cart(**kwargs):
                     "product_total": product["total"],
                     "discount_percentage": product["discountPercentage"],
                     "discounted_price": product["discountedTotal"],
-                    "thumbnail": product["thumbnail"]
+                    "thumbnail": product["thumbnail"],
+                    "load_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
 
         # Convert to DataFrame
@@ -172,6 +175,83 @@ def load_fake_invoice_to_postgres(**kwargs):
     engine = create_engine(postgres_url)
     df.to_sql(FAKE_TABLE_NAME, engine, if_exists='replace', index=False)
     logger.info("Fake invoice data loaded successfully into PostgreSQL")
+
+#Fetch products and reviews
+def fetch_fake_product(**kwargs):
+    url = "https://dummyjson.com/products"
+    response = requests.get(url)
+    data = response.json()["products"]
+    products_list = [] 
+    reviews_list = []
+
+    for product in data:
+        products_info = {
+            "id": product["id"],
+            "title": product["title"],
+            "description": product["description"],
+            "category": product["category"],
+            "price": product["price"],
+            "discountPercentage": product["discountPercentage"],
+            "rating": product.get("rating"),
+            "stock": product.get("stock"),
+            "brand": product.get("brand"),
+            "sku": product.get("sku")
+        }
+        products_list.append(products_info)
+
+    if "reviews" in product and product["reviews"]:
+        for review in product["reviews"]:
+            review_info = {
+                "product_id": product["id"],
+                "rating": review["rating"],
+                "comment": review["comment"],
+                "date": review["date"],
+                "reviewer_name": review["reviewerName"],
+                "reviewer_email": review["reviewerEmail"]
+            }
+            reviews_list.append(review_info)
+
+        products_list.append(products_info)
+
+        products_df=pd.DataFrame(products_list)
+        reviews_df=pd.DataFrame(reviews_list)
+
+
+        # Save the structured data
+        products_file_path = "/opt/airflow/products.csv"
+        reviews_file_path = "/opt/airflow/reviews.csv"
+        products_df.to_csv(products_file_path, index=False)
+        reviews_df.to_csv(reviews_file_path, index=False)
+        kwargs['ti'].xcom_push(key="product_data_path", value=products_file_path)
+        kwargs['ti'].xcom_push(key="reviews_data_path", value=reviews_file_path)
+
+
+def load_products_to_postgres(**kwargs):
+    ti = kwargs['ti']
+    file_path = ti.xcom_pull(task_ids='fetch_fake_product', key="product_data_path")
+    logger.info(f"Loading products data from: {file_path}")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    df = pd.read_csv(file_path)
+    conn = BaseHook.get_connection("postgres_def")
+    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+    engine = create_engine(postgres_url)
+    df.to_sql(PRODUCTS_TABLE_NAME, engine, if_exists='replace', index=False)
+    logger.info("Products loaded successfully into PostgreSQL")
+
+def load_reviews_to_postgres(**kwargs):
+    ti = kwargs['ti']
+    file_path = ti.xcom_pull(task_ids='fetch_fake_product', key="reviews_data_path")
+    logger.info(f"Loading reviews data from: {file_path}")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    df = pd.read_csv(file_path)
+    conn = BaseHook.get_connection("postgres_def")
+    postgres_url = f"postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+    engine = create_engine(postgres_url)
+    df.to_sql(REVIEWS_TABLE_NAME, engine, if_exists='replace', index=False)
+    logger.info("Reviews loaded successfully into PostgreSQL")
+
 
 # Define DAG
 default_args = {
@@ -227,18 +307,33 @@ fetch_cart = PythonOperator(
     dag=dag,
 )
 
-load_fake_invoice = PythonOperator(
+load_cart_db = PythonOperator(
     task_id='load_fake_invoice',
     python_callable=load_fake_invoice_to_postgres,
     dag=dag,
 )
 
-#generate_data >> push_to_sheet >> extract_sheet >> load_postgres
-generate_data >> [extract_sheet, fetch_cart]  # Ensure both tasks wait for faker generated data
-push_to_sheet >> extract_sheet
-extract_sheet >> load_postgres
+fetch_fake_products = PythonOperator(
+    task_id = 'fetch_fake_product',
+    python_callable=fetch_fake_product,
+    dag=dag,
+)
 
-fetch_cart >> load_fake_invoice
+load_products_db = PythonOperator(
+    task_id = 'load_products_to_postgres',
+    python_callable=load_products_to_postgres,
+    dag=dag,
+)
 
-# Ensure both data sources are loaded simultaneously
-[load_postgres, load_fake_invoice]
+load_reviews_db = PythonOperator(
+    task_id = 'load_reviews_to_postgres',
+    python_callable=load_reviews_to_postgres,
+    dag=dag,
+)
+
+
+#Load should happen at the same time for the sake of accuracy in db
+generate_data >> push_to_sheet >> extract_sheet
+extract_sheet >> fetch_cart
+fetch_cart >> fetch_fake_products
+fetch_fake_products >> [load_products_db, load_reviews_db, load_postgres, load_cart_db]
